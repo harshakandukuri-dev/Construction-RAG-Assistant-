@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: construction-rag-rag
+    runtime: python
+    rootDir: rag_service
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # add your LLM key here once we switch off Ollama, e.g. GROQ_API_KEY
+      - key: GROQ_API_KEY
+        sync: false
+
+  - type: web
+    name: construction-rag-api
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: RAG_URL
+        value: https://construction-rag-rag.onrender.com
+      - key: CLIENT_ORIGIN
+        value: https://construction-rag-assistantt.vercel.app,http://localhost:3000
+      - key: RAG_CONCURRENCY
+        value: "1"

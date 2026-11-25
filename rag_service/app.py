@@ -1,38 +1,29 @@
+"""HTTP API for the RAG pipeline. Start it with:  uvicorn app:app --port 8000"""
 
-import uuid
-import requests
-import chromadb
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-LLM_MODEL = "llama3.2"
+import rag
 
-# Initialize the embedding model and vector database.
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+log = logging.getLogger("rag")
 
-client = chromadb.PersistentClient(path="./chroma_db")
-collection = client.get_or_create_collection(
-    name="construction_docs",
-    metadata={"hnsw:space": "cosine"},
-)
 
-app = FastAPI(title="Construction RAG Service")
+@asynccontextmanager
+async def lifespan(_app):
+    if os.getenv("PRELOAD_EMBEDDER", "1") == "1":
+        log.warning("Loading embedding model %s ...", rag.EMBED_MODEL)
+        rag.get_embedder()  # first run downloads the model; later runs start fast
+        log.warning("Embedding model ready.")
+    yield
 
-INTERIOR_WORDS = [
-    "interior", "flooring", "tile", "ceiling", "paint",
-    "furniture", "lighting", "finish", "cabinet",
-    "wallpaper", "kitchen",
-]
 
-EXTERIOR_WORDS = [
-    "exterior", "facade", "façade", "cladding", "roof",
-    "landscape", "weatherproof", "paving", "boundary",
-    "elevation", "gate", "terrace",
-]
+app = FastAPI(title="Construction RAG Service", lifespan=lifespan)
 
 
 class IngestReq(BaseModel):
@@ -40,6 +31,7 @@ class IngestReq(BaseModel):
     doc_id: str
     project_id: str
     domain: str = "general"
+    title: str | None = None
 
 
 class Turn(BaseModel):
@@ -54,236 +46,74 @@ class QueryReq(BaseModel):
     history: list[Turn] = Field(default_factory=list)
 
 
-def chunk_text(text: str, size: int = 1000, overlap: int = 150):
-    chunks = []
-    start = 0
-
-    while start < len(text):
-        chunk = text[start:start + size]
-
-        if chunk.strip():
-            chunks.append(chunk)
-
-        start += size - overlap
-
-    return chunks
-
-
-def detect_domain(question: str):
-    question = question.lower()
-
-    interior_count = sum(
-        word in question for word in INTERIOR_WORDS
-    )
-    exterior_count = sum(
-        word in question for word in EXTERIOR_WORDS
-    )
-
-    if interior_count > exterior_count:
-        return "interior"
-
-    if exterior_count > interior_count:
-        return "exterior"
-
-    return None
-
-
-def ollama_chat(messages):
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": LLM_MODEL,
-                "messages": messages,
-                "stream": False,
-            },
-            timeout=120,
-        )
-
-        response.raise_for_status()
-        return response.json()["message"]["content"]
-
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama connection failed: {exc}",
-        ) from exc
-
-    except (ValueError, KeyError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid response received from Ollama.",
-        ) from exc
-
-
-@app.post("/ingest")
-def ingest(req: IngestReq):
-    try:
-        reader = PdfReader(req.file_path)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unable to read PDF: {exc}",
-        ) from exc
-
-    ids = []
-    documents = []
-    metadatas = []
-
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-
-        for chunk in chunk_text(text):
-            ids.append(str(uuid.uuid4()))
-            documents.append(chunk)
-            metadatas.append({
-                "doc_id": req.doc_id,
-                "project_id": req.project_id,
-                "domain": req.domain,
-                "page": page_number,
-            })
-
-    if documents:
-        embeddings = embedder.encode(documents).tolist()
-
-        collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
-
-    return {
-        "pages": len(reader.pages),
-        "chunks": len(documents),
-    }
-
-
-@app.post("/query")
-def query(req: QueryReq):
-    question = req.question.strip()
-
-    if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="Question cannot be empty.",
-        )
-
-    # Rewrite follow-up questions using previous conversation turns.
-    if req.history:
-        conversation = "\n".join(
-            f"{turn.role}: {turn.content}"
-            for turn in req.history
-            if turn.role in ("user", "assistant")
-        )
-
-        rewritten = ollama_chat([{
-            "role": "user",
-            "content": (
-                "Rewrite the latest question as a standalone question "
-                "using the conversation context. Return only the question.\n\n"
-                f"{conversation}\nuser: {question}"
-            ),
-        }]).strip()
-
-        if rewritten:
-            question = rewritten
-
-    # Apply project and optional domain filters.
-    domain = req.domain or detect_domain(question)
-
-    conditions = [{"project_id": req.project_id}]
-
-    if domain:
-        conditions.append({
-            "domain": {"$in": [domain, "general"]}
-        })
-
-    where = (
-        {"$and": conditions}
-        if len(conditions) > 1
-        else conditions[0]
-    )
-
-    # Retrieve relevant document chunks.
-    embedding = embedder.encode([question]).tolist()
-
-    result = collection.query(
-        query_embeddings=embedding,
-        n_results=5,
-        where=where,
-        include=["documents", "metadatas"],
-    )
-
-    chunks = (result.get("documents") or [[]])[0]
-    metadatas = (result.get("metadatas") or [[]])[0]
-
-    if not chunks:
-        return {
-            "answer": (
-                "I couldn't find relevant information in the "
-                "project documents."
-            ),
-            "sources": [],
-            "domain": domain,
-        }
-
-    context = "\n\n---\n\n".join(chunks)
-
-    messages = [{
-        "role": "system",
-        "content": (
-            "You are a construction and design assistant. "
-            "Answer only from the provided document context. "
-            "If the answer is missing, say the information is not "
-            "available in the provided documents. Never invent prices, "
-            "dimensions, or material specifications."
-        ),
-    }]
-
-    for turn in req.history:
-        if turn.role in ("user", "assistant"):
-            messages.append({
-                "role": turn.role,
-                "content": turn.content,
-            })
-
-    messages.append({
-        "role": "user",
-        "content": f"Context:\n{context}\n\nQuestion: {question}",
-    })
-
-    answer = ollama_chat(messages)
-
-    # Deduplicate sources.
-    sources = []
-    seen = set()
-
-    for metadata in metadatas:
-        if not metadata:
-            continue
-
-        key = (
-            metadata.get("doc_id"),
-            metadata.get("page"),
-            metadata.get("domain"),
-        )
-
-        if key not in seen:
-            seen.add(key)
-            sources.append({
-                "doc_id": metadata.get("doc_id"),
-                "page": metadata.get("page"),
-                "domain": metadata.get("domain"),
-            })
-
-    return {
-        "answer": answer,
-        "sources": sources,
-        "domain": domain,
-    }
+def _check(req: QueryReq):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    domain = req.domain if req.domain in rag.DOMAINS else None
+    return req.question.strip(), domain, [t.model_dump() for t in req.history]
 
 
 @app.get("/health")
 def health():
+    return {
+        "ok": True,
+        "model": rag.LLM_MODEL,
+        "embedder": rag.EMBED_MODEL,
+        "chunks": rag.get_collection().count(),
+        **rag.ollama_status(),
+    }
+
+
+@app.post("/ingest")
+def ingest(req: IngestReq):
+    if not os.path.isfile(req.file_path):
+        raise HTTPException(status_code=400, detail="The uploaded file could not be found on the document service.")
+    try:
+        result = rag.ingest_pdf(req.file_path, req.doc_id, req.project_id, req.domain, req.title)
+    except Exception as exc:  # unreadable or encrypted PDF
+        raise HTTPException(status_code=400, detail=f"Unable to read this PDF: {exc}") from exc
+    if result["chunks"] == 0:
+        rag.remove_document(req.doc_id)
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text found. This looks like a scanned PDF; run OCR on it first.",
+        )
+    return result
+
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: str):
+    rag.remove_document(doc_id)
     return {"ok": True}
+
+
+@app.post("/query")
+def query(req: QueryReq):
+    question, domain, history = _check(req)
+    text, meta = [], None
+    try:
+        for event in rag.answer_events(question, req.project_id, domain, history):
+            if event["type"] == "meta":
+                meta = event
+            elif event["type"] == "token":
+                text.append(event["text"])
+    except rag.OllamaError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"answer": "".join(text), "sources": meta["sources"], "domain": meta["domain"]}
+
+
+@app.post("/query/stream")
+def query_stream(req: QueryReq):
+    question, domain, history = _check(req)
+
+    def lines():
+        try:
+            for event in rag.answer_events(question, req.project_id, domain, history):
+                yield json.dumps(event) + "\n"
+        except rag.OllamaError as exc:
+            yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
+        except Exception:  # keep the stream well-formed whatever goes wrong
+            log.exception("Query failed")
+            yield json.dumps({"type": "error", "message": "Something went wrong while answering."}) + "\n"
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")

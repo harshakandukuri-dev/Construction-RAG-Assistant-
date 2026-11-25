@@ -1,0 +1,13 @@
+[
+  {
+    "question": "What membrane is used for roof waterproofing?",
+    "title": "Exterior specification.pdf",
+    "page": 12,
+    "keywords": ["membrane"]
+  },
+  {
+    "question": "What is the lobby floor finish?",
+    "domain": "interior",
+    "keywords": ["vitrified", "tile"]
+  }
+]

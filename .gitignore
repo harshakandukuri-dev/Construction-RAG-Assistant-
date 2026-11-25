@@ -10,3 +10,5 @@ uploads/
 !.env.example
 *.pdf
 *.log
+
+.pytest_cache/
